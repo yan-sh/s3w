@@ -1,0 +1,1 @@
+--command=cabal repl --clear --allow-eval --no-height-limit --allow-eval -o errors.err

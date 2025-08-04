@@ -1,0 +1,1 @@
+--command=cabal repl --clear --allow-eval -o errors.err
