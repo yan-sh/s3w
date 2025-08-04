@@ -16,6 +16,13 @@ let
 
   s3w = pkgs.haskellPackages.callPackage ./default.nix {};
 
+  s3_cacert = pkgs.cacert.override {
+    extraCertificateFiles =
+      [
+        ./root.crt
+      ];
+  };
+
 in
 
   bootstrap.dockerTools.buildImage {
@@ -23,8 +30,8 @@ in
     tag = "${version + (if gitrev == "" then "" else ("." + gitrev))}";
     copyToRoot = pkgs.buildEnv {
       name = "image-root";
-      paths = [ pkgs.coreutils pkgs.bash pkgs.ps pkgs.killall ];
-      pathsToLink = [ "/bin" ];
+      paths = [ pkgs.coreutils pkgs.bash pkgs.ps pkgs.killall s3_cacert ];
+      pathsToLink = [ "/bin" "/etc" ];
     };
     config.Cmd = [ "${s3w}/bin/s3w" ];
     created = "now"; 

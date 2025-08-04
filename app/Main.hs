@@ -47,7 +47,7 @@ log_ s ns ctxs msg = f ctx $ fromString msg
           Err   -> logErr
     ctx = addNamespace ns
       . Prelude.foldr (\(t, Ctx a) acc -> addContext (sl t a) . acc) id ctxs
-      $ mkLogger (logToHandle SIO.stdout)
+      $ mkLogger (logToHandle SIO.stderr)
 
 main :: IO ()
 main = do
@@ -103,7 +103,7 @@ app minioConn qh req rr
   , [bucket, key] <- pathInfo req 
   = do
 
-    log_ Err "to-client"
+    log_ Info "to-client"
       [ ("method", asCtx @Text "get")
       , ("bucket", asCtx bucket)
       , ("key", asCtx key)
@@ -132,7 +132,7 @@ app minioConn qh req rr
 
     takeMVar gorObjectInfoMVar >>= \case
       Left e -> do
-        log_ Err "to-client"
+        log_ Info "to-client"
           [ ("exception", asCtx $ show e)
           , ("method", asCtx @Text "get")
           , ("bucket", asCtx bucket)
@@ -162,6 +162,13 @@ app minioConn qh req rr
 app minioConn _ req rr
   | "PUT"         <- requestMethod req
   , [bucket, key] <- pathInfo req = do
+
+    log_ Info "from-client"
+      [ ("method", asCtx @Text "put")
+      , ("bucket", asCtx bucket)
+      , ("key", asCtx key)
+      ] "got request"
+
     let chunksReader f = do
           res <- liftIO f
           pure $ if B.null res then Nothing else Just (res, f)
