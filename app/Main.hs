@@ -47,7 +47,7 @@ log_ s ns ctxs msg = f ctx $ fromString msg
           Err   -> logErr
     ctx = addNamespace ns
       . Prelude.foldr (\(t, Ctx a) acc -> addContext (sl t a) . acc) id ctxs
-      $ mkLogger (logToHandle SIO.stderr)
+      $ mkLogger (logToHandle SIO.stdout)
 
 main :: IO ()
 main = do
