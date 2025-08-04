@@ -1,3 +1,3 @@
 #!/bin/bash
 
-nix-build && echo $(./result/bin/s3w --version)
+(nix-build > /dev/null) && echo $(./result/bin/s3w --version)
