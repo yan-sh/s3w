@@ -2,6 +2,7 @@
 
 module Main where
 
+import Prelude hiding (log)
 import Paths_s3w (version)
 import qualified System.Environment as Env
 import Control.Exception
@@ -31,6 +32,7 @@ import Colog.Json.Action
 import Data.Aeson
 import System.IO as SIO
 import Data.Version (showVersion)
+import Data.Time
 
 data LogSerevity = Info | Err
 
@@ -39,8 +41,9 @@ data Ctx = forall a . ToJSON a => Ctx a
 asCtx :: forall a . ToJSON a => a -> Ctx
 asCtx = Ctx
 
-log_ :: LogSerevity -> Text -> [(Text, Ctx)] -> String -> IO ()
-log_ s ns ctxs msg = f ctx $ fromString msg
+log :: LogSerevity -> Text -> [(Text, Ctx)] -> String -> IO ()
+log s ns ctxs msg = do
+  f ctx $ fromString msg
   where
     f = case s of
           Info  -> logInfo
@@ -59,7 +62,7 @@ main = do
       s3creds <- obtainS3Creds 
       conn <- join $ mkMinioConn (setRegion s3region . setCreds s3creds $ s3conn ) <$> newTlsManager
       port <- read <$> obtainEnv "S3W_PORT"
-      run port $ withQueueOperations $ app conn
+      run port $ withQueueOperationsMVar $ app conn
 
 obtainS3Creds :: IO CredentialValue
 obtainS3Creds = findFirst [fromAWSEnv] >>= \case
@@ -80,10 +83,10 @@ type OnTakingQ q = q -> IO () -> (ByteString -> IO ()) -> IO ()
 type PutQ q = q -> ByteString -> IO ()
 type CloseQ q = q -> IO ()
 
-withQueueOperations
+withQueueOperationsMVar
   ::  (forall q . QueueHandler q -> r)
   -> r
-withQueueOperations cont = cont $ QueueHandler
+withQueueOperationsMVar cont = cont $ QueueHandler
   do newEmptyMVar
   do \m_ onClose onTake -> takeMVar m_ >>= maybe onClose onTake
   do \m_ -> putMVar m_ . Just
@@ -98,16 +101,36 @@ data QueueHandler q = QueueHandler
 
 app :: MinioConn -> QueueHandler q -> Application
 
+type Logger = LogSerevity -> Text -> [(Text, Ctx)] -> String -> IO ()
+
+mkLogCurrentTime :: Logger -> Logger
+mkLogCurrentTime logger ls_ ns ctxs msg = do
+  time_ <- getCurrentTime
+  logger ls_ ns (ctxs <> [("time", asCtx time_)]) msg
+
+mkLogBucketKey :: Text -> Text -> Logger -> Logger
+mkLogBucketKey b k logger ls_ ns ctxs msg = logger ls_ ns ctxs_ msg
+  where ctxs_ = ctxs <>
+          [ ("bucket", asCtx b)
+          , ("key", asCtx k)
+          ]
+
+mkLogMethod :: Text -> Logger -> Logger
+mkLogMethod m logger ls_ ns ctxs msg = logger ls_ ns ctxs_ msg
+  where ctxs_ = ctxs <>
+          [ ("method", asCtx m)
+          ]
+
+
+
 app minioConn qh req rr
   | "GET"         <- requestMethod req
   , [bucket, key] <- pathInfo req 
   = do
+  
+    let log_ = mkLogBucketKey bucket key $ mkLogMethod "get" $ mkLogCurrentTime log
 
-    log_ Info "to-client"
-      [ ("method", asCtx @Text "get")
-      , ("bucket", asCtx bucket)
-      , ("key", asCtx key)
-      ] "got request"
+    log_ Info "client" [] "got request"
 
     q <- qh.makeQ
 
@@ -122,32 +145,15 @@ app minioConn qh req rr
 
         runConduit (gorObjectStream gor .| CC.mapM_ (liftIO . qh.putQ q ))
           ) `finally` qh.closeQ q `catch` \(e :: SomeException) ->
-            log_ Err "from-s3"
-              [ ("exception", asCtx $ show e)
-              , ("method", asCtx @Text "get")
-              , ("bucket", asCtx bucket)
-              , ("key", asCtx key)
-              ] 
-              "got exception"
+            log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
 
     takeMVar gorObjectInfoMVar >>= \case
       Left e -> do
-        log_ Info "to-client"
-          [ ("exception", asCtx $ show e)
-          , ("method", asCtx @Text "get")
-          , ("bucket", asCtx bucket)
-          , ("key", asCtx key)
-          ] "got exception"
+        log_ Err "s3" [ ("exception", asCtx $ show e) ] "got exception"
         rr $ responseLBS internalServerError500 [] ""
       Right gorObjectInfo_ -> do
         let size_ = T.pack $ show $ oiSize (gorObjectInfo_)
-        log_ Err "to-client"
-          [ ("method", asCtx @Text "get")
-          , ("length", asCtx size_)
-          , ("bucket", asCtx bucket)
-          , ("key", asCtx key)
-          ]
-          "start streaming"
+        log_ Info "client" [ ("length", asCtx size_) ] "start streaming"
         rr $ responseStream ok200
             [ ( hContentType, "application/octet-stream")
             , ( hContentLength, encodeUtf8 size_)
@@ -156,23 +162,31 @@ app minioConn qh req rr
             \sendChunk flush -> do
               let go = qh.onTakingQ q flush (\chunk -> sendChunk (fromByteString chunk) >> go)
                in go
-            
+     
 
 
 app minioConn _ req rr
   | "PUT"         <- requestMethod req
   , [bucket, key] <- pathInfo req = do
 
-    log_ Info "from-client"
-      [ ("method", asCtx @Text "put")
-      , ("bucket", asCtx bucket)
-      , ("key", asCtx key)
-      ] "got request"
+    let log_ = mkLogBucketKey bucket key $ mkLogMethod "put" $ mkLogCurrentTime log
 
-    let chunksReader f = do
+    log_ Info "client" [] "got request"
+    try (runMinioWith minioConn do
+      putObject bucket key
+        (unfoldM chunksReader (getRequestBodyChunk req)) Nothing defaultPutObjectOptions
+        ) >>= \case
+          Left (e :: SomeException) -> do
+            log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
+            rr $ responseLBS internalServerError500 [] ""
+          Right _ -> do 
+            log_ Info "client" [] "start streaming"
+            rr $ responseLBS ok200 [] ""
+      where
+        chunksReader f = do
           res <- liftIO f
           pure $ if B.null res then Nothing else Just (res, f)
-    _ <- runMinioWith minioConn (putObject bucket key (unfoldM chunksReader (getRequestBodyChunk req)) Nothing defaultPutObjectOptions)
-    rr $ responseLBS ok200 [] ""
+
+
 
 app _ _ _ rr = rr $ responseLBS badRequest400 [] "API is not supported yet"
