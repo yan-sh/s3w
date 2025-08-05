@@ -123,69 +123,84 @@ mkLogMethod m logger ls_ ns ctxs msg = logger ls_ ns ctxs_ msg
 
 
 
-app minioConn qh req rr
-  | "GET"         <- requestMethod req
-  , [bucket, key] <- pathInfo req 
-  = do
+app minioConn qh_ req_ rr_
+  | "GET"           <- requestMethod req_
+  , [bucket_, key_] <- pathInfo req_ = do
+    let log' = mkLogBucketKey bucket_ key_ $ mkLogMethod "get" $ mkLogCurrentTime log
+    q_ <- qh_.makeQ
+    gorObjectInfoMVar_ <- newEmptyMVar
+    go qh_ rr_ bucket_ key_ log' q_ gorObjectInfoMVar_ where
+
+    go qh rr bucket key (log_ :: Logger) q gorObjectInfoMVar = do
   
-    let log_ = mkLogBucketKey bucket key $ mkLogMethod "get" $ mkLogCurrentTime log
-
-    log_ Info "client" [] "got request"
-
-    q <- qh.makeQ
-
-    gorObjectInfoMVar <- newEmptyMVar
-    
-    _ <- async do
-      (void $ runMinioWith minioConn do
-        gor <- do
-          U.try (getObject bucket key defaultGetObjectOptions) >>= \case
-            Left (e :: SomeException) -> U.putMVar gorObjectInfoMVar (Left e) >> U.throwIO e
-            Right gor -> gor <$ U.putMVar gorObjectInfoMVar (Right $ gorObjectInfo gor)
-
-        runConduit (gorObjectStream gor .| CC.mapM_ (liftIO . qh.putQ q ))
-          ) `finally` qh.closeQ q `catch` \(e :: SomeException) ->
-            log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
-
-    takeMVar gorObjectInfoMVar >>= \case
-      Left e -> do
-        log_ Err "s3" [ ("exception", asCtx $ show e) ] "got exception"
-        rr $ responseLBS internalServerError500 [] ""
-      Right gorObjectInfo_ -> do
-        let size_ = T.pack $ show $ oiSize (gorObjectInfo_)
-        log_ Info "client" [ ("length", asCtx size_) ] "start streaming"
-        rr $ responseStream ok200
-            [ ( hContentType, "application/octet-stream")
-            , ( hContentLength, encodeUtf8 size_)
-            , ( "content-disposition", "attachment; filename=" <> TE.encodeUtf8 key)
-            ]
-            \sendChunk flush -> do
-              let go = qh.onTakingQ q flush (\chunk -> sendChunk (fromByteString chunk) >> go)
-               in go
+      log_ Info "client" [] "got request"
      
+      void $ async do
+        minioGet
+          `catch` \(e :: SomeException) -> log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
+          `finally` qh.closeQ q
 
+      takeMVar gorObjectInfoMVar >>= \case
+        Left e -> do
+          log_ Err "s3" [ ("exception", asCtx $ show e) ] "got exception"
+          rr $ responseLBS internalServerError500 [] ""
+        Right gorObjectInfo_
+          | size_ <- T.pack $ show $ oiSize gorObjectInfo_ -> do
+          rr $ responseStream ok200
+              [ ( hContentType, "application/octet-stream")
+              , ( hContentLength, encodeUtf8 size_)
+              , ( "content-disposition", "attachment; filename=" <> TE.encodeUtf8 key)
+              ]
+              chunkStreamer
 
-app minioConn _ req rr
-  | "PUT"         <- requestMethod req
-  , [bucket, key] <- pathInfo req = do
+        where
 
-    let log_ = mkLogBucketKey bucket key $ mkLogMethod "put" $ mkLogCurrentTime log
+          chunkStreamer sendChunk flush = 
+            let go_ = qh.onTakingQ q flush (\chunk -> sendChunk (fromByteString chunk) >> go_)
+            in go_
 
-    log_ Info "client" [] "got request"
-    try (runMinioWith minioConn do
-      putObject bucket key
-        (unfoldM chunksReader (getRequestBodyChunk req)) Nothing defaultPutObjectOptions
-        ) >>= \case
-          Left (e :: SomeException) -> do
-            log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
-            rr $ responseLBS internalServerError500 [] ""
-          Right _ -> do 
+          minioGet = do
             log_ Info "client" [] "start streaming"
-            rr $ responseLBS ok200 [] ""
-      where
-        chunksReader f = do
-          res <- liftIO f
-          pure $ if B.null res then Nothing else Just (res, f)
+            void $ runMinioWith minioConn do
+              gor <- do
+                U.try (getObject bucket key defaultGetObjectOptions) >>= \case
+                  Left (e :: SomeException) -> U.putMVar gorObjectInfoMVar (Left e) >> U.throwIO e
+                  Right gor -> gor <$ U.putMVar gorObjectInfoMVar (Right $ gorObjectInfo gor)
+              runConduit (gorObjectStream gor .| CC.mapM_ (liftIO . qh.putQ q ))
+            log_ Info "client" [] "streaming done"
+
+    
+
+
+app minioConn _ req_ rr_
+  | "PUT"           <- requestMethod req_
+  , [bucket_, key_] <- pathInfo req_ = do
+    let log' = mkLogBucketKey bucket_ key_ $ mkLogMethod "put" $ mkLogCurrentTime log
+    go rr_ bucket_ key_ log' req_  where
+
+    go rr bucket key (log_ :: Logger) req = do
+      log_ Info "client" [] "got request"
+      try minioPut >>= \case
+        Right _ -> rr $ responseLBS ok200 [] ""
+        Left (e :: SomeException) -> do
+          log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
+          rr $ responseLBS internalServerError500 [] ""
+        where
+
+          minioPut = do 
+            log_ Info "client" [] "start streaming"
+            void
+              $ runMinioWith minioConn
+              $ putObject bucket key
+                  (unfoldM chunksStreamer (getRequestBodyChunk req))
+                  Nothing
+                  defaultPutObjectOptions
+            log_ Info "client" [] "streaming done"
+
+          chunksStreamer f = do
+            res <- liftIO f
+            pure $ if B.null res then Nothing else Just (res, f)
+
 
 
 
