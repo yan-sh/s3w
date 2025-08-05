@@ -137,7 +137,7 @@ app minioConn qh_ req_ rr_
      
       void $ async do
         minioGet
-          `catch` \(e :: SomeException) -> log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
+          `catch` (\(e :: SomeException) -> log_ Err "s3" [("exception", asCtx $ show e) ] "got exception")
           `finally` qh.closeQ q
 
       takeMVar gorObjectInfoMVar >>= \case
