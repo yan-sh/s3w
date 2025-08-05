@@ -194,7 +194,7 @@ app minioConn _ req_ rr_
               $ putObject bucket key
                   (unfoldM chunksStreamer (getRequestBodyChunk req))
                   Nothing
-                  defaultPutObjectOptions
+                  defaultPutObjectOptions { pooUserMetadata = [("if-none-match", "*")] }
             log_ Info "client" [] "streaming done"
 
           chunksStreamer f = do
