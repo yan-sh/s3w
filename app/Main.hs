@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module Main where
 
@@ -33,6 +34,11 @@ import Data.Aeson
 import System.IO as SIO
 import Data.Version (showVersion)
 import Data.Time
+import Text.Read (readMaybe)
+import Data.List as L
+
+pattern KeyBucket :: Text -> Text -> [Text]
+pattern KeyBucket k b <- b : (mconcat . L.intersperse (T.pack "/") -> k)
 
 data LogSerevity = Info | Err
 
@@ -124,8 +130,8 @@ mkLogMethod m logger ls_ ns ctxs msg = logger ls_ ns ctxs_ msg
 
 
 app minioConn qh_ req_ rr_
-  | "GET"           <- requestMethod req_
-  , [bucket_, key_] <- pathInfo req_ = do
+  | "GET"                   <- requestMethod req_
+  , KeyBucket key_ bucket_  <- pathInfo req_ = do
     let log' = mkLogBucketKey bucket_ key_ $ mkLogMethod "get" $ mkLogCurrentTime log
     q_ <- qh_.makeQ
     gorObjectInfoMVar_ <- newEmptyMVar
@@ -160,25 +166,24 @@ app minioConn qh_ req_ rr_
             in go_
 
           minioGet = do
-            log_ Info "client" [] "start streaming"
+            log_ Info "client" [] "start getting"
             void $ runMinioWith minioConn do
               gor <- do
                 U.try (getObject bucket key defaultGetObjectOptions) >>= \case
                   Left (e :: SomeException) -> U.putMVar gorObjectInfoMVar (Left e) >> U.throwIO e
                   Right gor -> gor <$ U.putMVar gorObjectInfoMVar (Right $ gorObjectInfo gor)
               runConduit (gorObjectStream gor .| CC.mapM_ (liftIO . qh.putQ q ))
-            log_ Info "client" [] "streaming done"
+            log_ Info "client" [] "getting done"
 
     
 
-
-app minioConn _ req_ rr_
-  | "PUT"           <- requestMethod req_
-  , [bucket_, key_] <- pathInfo req_ = do
+app minioConn_ _ req_ rr_
+  | "PUT"                   <- requestMethod req_
+  , KeyBucket key_ bucket_  <- pathInfo req_ = do
     let log' = mkLogBucketKey bucket_ key_ $ mkLogMethod "put" $ mkLogCurrentTime log
-    go rr_ bucket_ key_ log' req_  where
+    go rr_ bucket_ key_ log' req_ minioConn_ where
 
-    go rr bucket key (log_ :: Logger) req = do
+    go rr bucket key (log_ :: Logger) req minioConn = do
       log_ Info "client" [] "got request"
       try minioPut >>= \case
         Right _ -> rr $ responseLBS ok200 [] ""
@@ -188,14 +193,27 @@ app minioConn _ req_ rr_
         where
 
           minioPut = do 
-            log_ Info "client" [] "start streaming"
+            log_ Info "client" [] "start putting"
             void
               $ runMinioWith minioConn
-              $ putObject bucket key
-                  (unfoldM chunksStreamer (getRequestBodyChunk req))
-                  Nothing
-                  defaultPutObjectOptions { pooUserMetadata = [("if-none-match", "*")] }
-            log_ Info "client" [] "streaming done"
+              $ case lookup hContentLength (requestHeaders req) of
+                  Just (readMaybe . T.unpack . TE.decodeUtf8 -> Just length_) -> do
+                    putObjectStream bucket key
+                      (unfoldM chunksStreamer (getRequestBodyChunk req))
+                      length_
+                      minioConn
+                      defaultPutObjectOptions
+                        { pooIfNoneMatch = Just "*"
+                        , pooContentDisposition = TE.decodeUtf8 <$> lookup "content-disposition" (requestHeaders req)
+                        }
+                  _ -> do
+                    liftIO $ log_ Info "s3" [] "no streaming"
+                    putObject bucket key
+                      (unfoldM chunksStreamer (getRequestBodyChunk req))
+                      Nothing
+                      defaultPutObjectOptions
+
+            log_ Info "client" [] "putting done"
 
           chunksStreamer f = do
             res <- liftIO f

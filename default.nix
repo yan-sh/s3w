@@ -23,6 +23,7 @@ let
           "${ghcVersion}" = pkgs.haskell.packages."${ghcVersion}".override {
             overrides = haskellPackagesNew: haskellPackagesOld: rec {
               co-log-json = haskellPackagesNew.callPackage ./co-log-json.nix { };
+              minio-hs = haskellPackagesNew.callPackage ./minio-hs-github.nix { };
               s3w = haskellPackagesNew.developPackage {
                 root = ./.;
                 modifier = (t.flip t.pipe)
