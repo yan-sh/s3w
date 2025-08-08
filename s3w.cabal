@@ -47,3 +47,4 @@ executable s3w
       , time
     hs-source-dirs:   app
     default-language: GHC2021
+    ghc-options: -threaded "-with-rtsopts= -N -A128m -AL256m -I0"
