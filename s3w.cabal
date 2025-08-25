@@ -45,6 +45,8 @@ executable s3w
       , co-log-json >= 0.1.0.2
       , aeson >= 2.0
       , time
+      , stm
+      , uri-encode
     hs-source-dirs:   app
     default-language: GHC2021
-    ghc-options: -threaded "-with-rtsopts= -N -A128m -AL256m -I0"
+    ghc-options: -threaded "-with-rtsopts= -N4 -A32m -AL64m -I0 -xn -qg"

@@ -13,8 +13,8 @@ mkDerivation {
   version = "1.7.0";
   src = fetchgit {
     url = "https://github.com/yan-sh/minio-hs.git";
-    sha256 = "0hpn9k3qf3hkbxj1llji5bw0n6q801gyvs4qh65xgzr75ik7gn5r";
-    rev = "b4986b31284ef54d12da75565618c41039e3f808";
+    sha256 = "063dbm675jn7xq6krg1z1gn54n0p4gzxh2cpnfxfav7whlm7y8cv";
+    rev = "3f0ae4aff50398e4ba082f0ed6d0b1dae12cd898";
     fetchSubmodules = true;
   };
   isLibrary = true;

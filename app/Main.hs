@@ -1,5 +1,6 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ImpredicativeTypes #-}
 
 module Main where
 
@@ -12,7 +13,7 @@ import Control.Concurrent
 import GHC.Exception
 import Network.Wai.Handler.Warp
 import Network.Wai
-import Network.Minio 
+import Network.Minio
 import Network.HTTP.Types
 import Network.HTTP.Client.TLS
 import Data.Text as T
@@ -36,39 +37,95 @@ import Data.Version (showVersion)
 import Data.Time
 import Text.Read (readMaybe)
 import Data.List as L
+import Data.Functor ((<&>))
+import Data.Function ((&), fix)
+import Data.Maybe (isJust)
+import Control.Concurrent.STM
+import GHC.IO.Unsafe (unsafePerformIO)
+import qualified Network.URI.Encode as URI.Encode
+
+
+data S3WErr = S3WErrCL
 
 pattern KeyBucket :: Text -> Text -> [Text]
-pattern KeyBucket k b <- b : (mconcat . L.intersperse (T.pack "/") -> k)
+pattern KeyBucket k b <- (URI.Encode.decodeText -> b) : (URI.Encode.decodeText . mconcat . L.intersperse (T.pack "/") -> k)
 
-data LogSerevity = Info | Err
+
+data LogSerevity = Debug | Info | Err 
+  deriving (Eq, Ord, Read)
+
+minimalLogSeverity :: TVar LogSerevity
+minimalLogSeverity = unsafePerformIO $ newTVarIO Info  
 
 data Ctx = forall a . ToJSON a => Ctx a 
 
+data MinioResult a = 
+    MinioError MinioErr
+  | MinioException SomeException
+  | MinioSuccess a
+
+pass :: Applicative f => f ()
+pass = pure ()
+
+consumeMinioResult
+  :: Logger
+  -> IO b
+  -> IO b
+  -> (a -> IO b)
+  -> MinioResult a
+  -> IO b
+consumeMinioResult log_ onExcp onErr onSucc = \case
+  MinioException e -> do
+    log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
+    onExcp
+  MinioError me ->  do
+    log_ Err "s3" [("error", asCtx $ show me) ] "got minio error"
+    onErr
+  MinioSuccess x -> onSucc x 
+  
+
+
 asCtx :: forall a . ToJSON a => a -> Ctx
 asCtx = Ctx
+
+
 
 log :: LogSerevity -> Text -> [(Text, Ctx)] -> String -> IO ()
 log s ns ctxs msg = do
   f ctx $ fromString msg
   where
-    f = case s of
-          Info  -> logInfo
-          Err   -> logErr
+    withCheckLogSerevity f_ = do
+      min_ <- readTVarIO minimalLogSeverity
+      if s < min_
+         then pass
+         else f_
+
+    f ctx_ msg_ = 
+      case s of
+        Info  -> withCheckLogSerevity $ logInfo ctx_ msg_
+        Err   -> withCheckLogSerevity $ logErr ctx_ msg_
+        Debug -> withCheckLogSerevity $ logDebug ctx_ msg_
     ctx = addNamespace ns
       . Prelude.foldr (\(t, Ctx a) acc -> addContext (sl t a) . acc) id ctxs
       $ mkLogger (logToHandle SIO.stderr)
+
+
 
 main :: IO ()
 main = do
   Env.getArgs >>= \case
     ["--version"] -> putStrLn (showVersion version)
     _ -> do
-      s3region <- T.pack <$> obtainEnv "S3_REGION"
-      s3conn <- fromString <$> obtainEnv "S3_CONN_STR"
-      s3creds <- obtainS3Creds 
-      conn <- join $ mkMinioConn (setRegion s3region . setCreds s3creds $ s3conn ) <$> newTlsManager
+      minioRunner <- mkMinioAppRunner 
       port <- read <$> obtainEnv "S3W_PORT"
-      withQueueOperationsMVar (run port) (app conn)
+      
+      (Env.lookupEnv "S3W_MIN_LOG" <&> join . fmap readMaybe)
+        >>= maybe pass (atomically . writeTVar minimalLogSeverity)
+
+      withQueueOperationsMVar
+        ((mkLogCurrentTime $ log) Debug "queue" [])
+        (run port)
+        (app minioRunner)
 
 obtainS3Creds :: IO CredentialValue
 obtainS3Creds = findFirst [fromAWSEnv] >>= \case
@@ -90,16 +147,19 @@ obtainEnv env = do
 -- type CloseQ q = q -> IO ()
 
 withQueueOperationsMVar
-  :: (a -> IO b)
+  :: (String -> IO ())
+  -> (a -> IO b)
   -> (IO QueueHandler -> a)
   -> IO b
-withQueueOperationsMVar f1 f2 = do
+withQueueOperationsMVar log_ f1 f2 = do
   f1 $ f2 do
     q <- newEmptyMVar
     pure $ QueueHandler
-      do (\onClose onTake -> takeMVar q >>= maybe onClose onTake)
-      do putMVar q . Just
-      do putMVar q Nothing
+      do \onClose onTake -> takeMVar q >>= \case
+            Nothing -> log_ "on close" >> onClose
+            Just x  -> log_ "on take" >> onTake x
+      do \x -> log_ "put" >> putMVar q (Just x)
+      do log_ "close" >> putMVar q Nothing
 
 data QueueHandler = QueueHandler
   { onTakingQ :: forall a . IO a -> (ByteString -> IO a) -> IO a
@@ -129,8 +189,30 @@ mkLogMethod m logger ls_ ns ctxs msg = logger ls_ ns ctxs_ msg
           ]
 
 
-app :: MinioConn -> IO QueueHandler -> Application
-app minioConn mkQ req@(pathInfo -> KeyBucket key bucket) rr | "GET" <- requestMethod req= do
+data MinioHandler = MinioHandler (forall a . (MinioConn -> Minio a) -> IO (MinioResult a)) 
+
+mkMinioAppRunner :: IO MinioHandler
+mkMinioAppRunner = do
+  s3region <- T.pack <$> obtainEnv "S3_REGION"
+  s3conn <- fromString <$> obtainEnv "S3_CONN_STR"
+  s3creds <- obtainS3Creds 
+  conn <- join $ mkMinioConn (setRegion s3region . setCreds s3creds $ s3conn ) <$> newTlsManager
+  pure $ MinioHandler \f -> do
+    try (runMinioWith conn (f conn)) <&> \case
+      Left e          -> MinioException e
+      Right (Left me) -> MinioError me
+      Right (Right s) -> MinioSuccess s
+
+mkPutObjectOptions :: [Header] -> PutObjectOptions
+mkPutObjectOptions = L.foldr f defaultPutObjectOptions
+  where
+    f (h,v) acc
+      | h == "if-none-match" = acc { pooIfNoneMatch = Just "*" }
+      | h == "content-disposition" = acc { pooContentDisposition = Just $ TE.decodeUtf8 v}
+      | otherwise = acc
+
+app :: MinioHandler -> IO QueueHandler -> Application
+app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "GET" <- requestMethod req= do
     let log_ = mkLogBucketKey bucket key $ mkLogMethod "get" $ mkLogCurrentTime log
     QueueHandler{..} <- mkQ
     gorObjectInfoMVar <- newEmptyMVar
@@ -142,24 +224,30 @@ app minioConn mkQ req@(pathInfo -> KeyBucket key bucket) rr | "GET" <- requestMe
           in go_ 
 
         minioGet = do
-          log_ Info "client" [] "start getting"
-          void $ runMinioWith minioConn do
-            gor <- do
-              U.try (getObject bucket key defaultGetObjectOptions) >>= \case
-                Left (e :: SomeException) -> U.putMVar gorObjectInfoMVar (Left e) >> U.throwIO e
-                Right gor -> gor <$ U.putMVar gorObjectInfoMVar (Right $ gorObjectInfo gor)
-            runConduit (gorObjectStream gor .| CC.mapM_ (liftIO . putQ))
-          log_ Info "client" [] "getting done"
+
+          gor <- do
+            U.try (getObject bucket key defaultGetObjectOptions) >>= \case
+              Left (e :: SomeException) -> do
+                U.putMVar gorObjectInfoMVar $ Left e
+                U.throwIO e
+              Right gor -> do
+                U.putMVar gorObjectInfoMVar $ Right $ gorObjectInfo gor
+                pure gor 
+
+          runConduit $ gorObjectStream gor .| CC.mapM_ (liftIO . putQ)
  
     void $ async do
-      minioGet
-        `catch` (\(e :: SomeException) -> log_ Err "s3" [("exception", asCtx $ show e) ] "got exception")
-        `finally` closeQ
+
+      log_ Info "client" [] "start getting"
+
+      runMinioApp (const minioGet) >>= consumeMinioResult log_ pass pass (const pass)
+        
+      closeQ
+
+      log_ Info "client" [] "getting done"
 
     takeMVar gorObjectInfoMVar >>= \case
-      Left e -> do
-        log_ Err "s3" [ ("exception", asCtx $ show e) ] "got exception"
-        rr $ responseLBS internalServerError500 [] ""
+      Left _e -> rr $ responseLBS internalServerError500 [] ""
       Right gorObjectInfo_
         | size_ <- T.pack $ show $ oiSize gorObjectInfo_ -> do
         rr $ responseStream ok200
@@ -170,58 +258,45 @@ app minioConn mkQ req@(pathInfo -> KeyBucket key bucket) rr | "GET" <- requestMe
             chunkStreamer
 
 
-    
-
-app minioConn mkQ req@(pathInfo -> KeyBucket key bucket) rr | "PUT" <- requestMethod req = do
+   
+app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "PUT" <- requestMethod req = do
   let log_ = mkLogBucketKey bucket key $ mkLogMethod "put" $ mkLogCurrentTime log
   QueueHandler{..} <- mkQ
 
   log_ Info "client" [] "got request"
 
-  let minioPut = do 
-        log_ Info "client" [] "start putting"
-        void
-          $ runMinioWith minioConn
-          $ case lookup hContentLength (requestHeaders req) of
-              Just (readMaybe . T.unpack . TE.decodeUtf8 -> Just length_) -> do
-                putObjectStream bucket key
-                  (unfoldM (liftIO . reqBodyStreamSink) ())
-                  length_
-                  minioConn
-                  defaultPutObjectOptions
-                    { pooIfNoneMatch = Just "*"
-                    , pooContentDisposition = TE.decodeUtf8 <$> lookup "content-disposition" (requestHeaders req)
-                    }
-              _ -> do
-                liftIO $ log_ Info "s3" [] "no streaming"
-                putObject bucket key
-                  (unfoldM (liftIO . reqBodyStreamSink) ())
-                  Nothing
-                  defaultPutObjectOptions
+  let minioPut minioConn = withContentLength \length_ -> 
+        if uploadStreamly
+           then putObjectStream bucket key streamer length_ minioConn opts
+           else putObject bucket key streamer Nothing opts
+        where
+          uploadStreamly = not $ isJust $ lookup "s3w-no-stream" (requestHeaders req)
+          streamer = unfoldM (liftIO . const (onTakingQ (pure Nothing) \bs -> pure $ Just (bs, ()))) ()
+          opts = mkPutObjectOptions $ requestHeaders req
+          withContentLength f =
+            case lookup hContentLength (requestHeaders req) of
+              Just (readMaybe . T.unpack . TE.decodeUtf8 -> Just length_) -> Right <$> f length_
+              _ -> pure $ Left S3WErrCL
+ 
+  void $ async $ fix \f -> do
+    chunk <- getRequestBodyChunk req
+    if B.null chunk
+       then closeQ
+       else putQ chunk >> f
 
-        log_ Info "client" [] "putting done"
+  log_ Info "client" [] "start putting"
 
-      reqBodyStreamSource = do
-        chunk <- getRequestBodyChunk req
-        if B.null chunk
-           then closeQ
-           else putQ chunk >> reqBodyStreamSource 
-
-      reqBodyStreamSink _ =
-        onTakingQ (pure Nothing) (\bs -> pure $ Just (bs, ()))
+  minioResult <- runMinioApp minioPut
   
-  _ <- async reqBodyStreamSource
+  log_ Info "client" [] "putting done"
 
-  try minioPut >>= \case
-    Right _ -> do
-      rr $ responseLBS ok200 [] ""
-    Left (e :: SomeException) -> do
-      log_ Err "s3" [("exception", asCtx $ show e) ] "got exception"
-      rr $ responseLBS internalServerError500 [] ""
+  minioResult & consumeMinioResult log_
+    do rr $ responseLBS internalServerError500 [] ""
+    do rr $ responseLBS internalServerError500 [] ""
+    \case
+      (Left S3WErrCL) -> rr $ responseLBS status400 [] "\"Content-Length\" not found"
+      (Right _) -> rr $ responseLBS ok200 [] ""
+      
 
-      -- reqBodyStreamSink _ = onTakingQ q (pure Nothing) (\bs -> pure $ Just (bs, ()))
-            
-
-
-
+    
 app _ _ _ rr = rr $ responseLBS badRequest400 [] "API is not supported yet"

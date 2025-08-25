@@ -2,3 +2,4 @@ dist-newstyle
 .env
 result
 errors.err
+tags*
