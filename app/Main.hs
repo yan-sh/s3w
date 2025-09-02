@@ -55,7 +55,7 @@ data LogSerevity = Debug | Info | Err
   deriving (Eq, Ord, Read)
 
 minimalLogSeverity :: TVar LogSerevity
-minimalLogSeverity = unsafePerformIO $ newTVarIO Info  
+minimalLogSeverity = unsafePerformIO $ newTVarIO Info
 
 data Ctx = forall a . ToJSON a => Ctx a 
 
@@ -156,10 +156,14 @@ withQueueOperationsMVar log_ f1 f2 = do
     q <- newEmptyMVar
     pure $ QueueHandler
       do \onClose onTake -> takeMVar q >>= \case
-            Nothing -> log_ "on close" >> onClose
-            Just x  -> log_ "on take" >> onTake x
-      do \x -> log_ "put" >> putMVar q (Just x)
-      do log_ "close" >> putMVar q Nothing
+            Nothing -> do
+              r <- onClose
+              r <$ log_ "on close"
+            Just x  -> do
+              r <- onTake x
+              r <$ log_ "on take"
+      do \x -> putMVar q (Just x) >> log_ "put"
+      do putMVar q Nothing >> log_ "close"
 
 data QueueHandler = QueueHandler
   { onTakingQ :: forall a . IO a -> (ByteString -> IO a) -> IO a
@@ -220,8 +224,7 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
     log_ Info "client" [] "got request"
     
     let chunkStreamer sendChunk flush = 
-          let go_ = onTakingQ flush (\chunk -> sendChunk (fromByteString chunk) >> go_)
-          in go_ 
+          fix \f -> onTakingQ flush \chunk -> sendChunk (fromByteString chunk) >> f
 
         minioGet = do
 
@@ -270,7 +273,7 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
            then putObjectStream bucket key streamer length_ minioConn opts
            else putObject bucket key streamer Nothing opts
         where
-          uploadStreamly = not $ isJust $ lookup "s3w-no-stream" (requestHeaders req)
+          uploadStreamly = isJust $ lookup "s3w-stream" $ requestHeaders req
           streamer = unfoldM (liftIO . const (onTakingQ (pure Nothing) \bs -> pure $ Just (bs, ()))) ()
           opts = mkPutObjectOptions $ requestHeaders req
           withContentLength f =
