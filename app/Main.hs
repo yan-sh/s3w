@@ -122,7 +122,7 @@ main = do
       (Env.lookupEnv "S3W_MIN_LOG" <&> join . fmap readMaybe)
         >>= maybe pass (atomically . writeTVar minimalLogSeverity)
 
-      withQueueOperationsMVar
+      withQueueOperationsTBQueue
         ((mkLogCurrentTime $ log) Debug "queue" [])
         (run port)
         (app minioRunner)
@@ -146,29 +146,39 @@ obtainEnv env = do
 -- type PutQ q = q -> ByteString -> IO ()
 -- type CloseQ q = q -> IO ()
 
-withQueueOperationsMVar
+withQueueOperationsTBQueue
   :: (String -> IO ())
   -> (a -> IO b)
   -> (IO QueueHandler -> a)
   -> IO b
-withQueueOperationsMVar log_ f1 f2 = do
+withQueueOperationsTBQueue log_ f1 f2 = do
   f1 $ f2 do
-    q <- newEmptyMVar
+    q <- newTBQueueIO 64
+    active <- newTVarIO True
     pure $ QueueHandler
-      do \onClose onTake -> takeMVar q >>= \case
+      { onTakingQ = \onClose onTake -> do
+          mchunk <- atomically $ readTBQueue q
+          case mchunk of
             Nothing -> do
               r <- onClose
               r <$ log_ "on close"
-            Just x  -> do
+            Just x -> do
               r <- onTake x
               r <$ log_ "on take"
-      do \x -> putMVar q (Just x) >> log_ "put"
-      do putMVar q Nothing >> log_ "close"
+      , putQ = \x -> atomically $ do
+          a <- readTVar active
+          when a $ writeTBQueue q (Just x)
+      , closeQ = atomically $ do
+          writeTVar active False
+          writeTBQueue q Nothing
+      , stopQ = atomically $ writeTVar active False
+      }
 
 data QueueHandler = QueueHandler
   { onTakingQ :: forall a . IO a -> (ByteString -> IO a) -> IO a
   , putQ :: ByteString -> IO ()
   , closeQ :: IO ()
+  , stopQ :: IO ()
   }
 
 
@@ -239,7 +249,7 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
 
           runConduit $ gorObjectStream gor .| CC.mapM_ (liftIO . putQ)
  
-    void $ async do
+    asyncGet <- async do
 
       log_ Info "client" [] "start getting"
 
@@ -250,7 +260,10 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
       log_ Info "client" [] "getting done"
 
     takeMVar gorObjectInfoMVar >>= \case
-      Left _e -> rr $ responseLBS internalServerError500 [] ""
+      Left _e -> do
+        stopQ
+        cancel asyncGet
+        rr $ responseLBS internalServerError500 [] ""
       Right gorObjectInfo_
         | size_ <- T.pack $ show $ oiSize gorObjectInfo_ -> do
         rr $ responseStream ok200
@@ -281,7 +294,7 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
               Just (readMaybe . T.unpack . TE.decodeUtf8 -> Just length_) -> Right <$> f length_
               _ -> pure $ Left S3WErrCL
  
-  void $ async $ fix \f -> do
+  asyncPut <- async $ fix \f -> do
     chunk <- getRequestBodyChunk req
     if B.null chunk
        then closeQ
@@ -294,10 +307,10 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
   log_ Info "client" [] "putting done"
 
   minioResult & consumeMinioResult log_
-    do rr $ responseLBS internalServerError500 [] ""
-    do rr $ responseLBS internalServerError500 [] ""
+    do stopQ >> cancel asyncPut >> rr (responseLBS internalServerError500 [] "")
+    do stopQ >> cancel asyncPut >> rr (responseLBS internalServerError500 [] "")
     \case
-      (Left S3WErrCL) -> rr $ responseLBS status400 [] "\"Content-Length\" not found"
+      (Left S3WErrCL) -> stopQ >> cancel asyncPut >> rr (responseLBS status400 [] "\"Content-Length\" not found")
       (Right _) -> rr $ responseLBS ok200 [] ""
       
 
