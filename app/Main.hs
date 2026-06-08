@@ -217,7 +217,7 @@ mkMinioAppRunner = do
   s3region <- T.pack <$> obtainEnv "S3_REGION"
   s3conn <- fromString <$> obtainEnv "S3_CONN_STR"
   s3creds <- obtainS3Creds 
-  mgr <- newManager tlsManagerSettings { managerConnCount = 20 }
+  mgr <- newManager tlsManagerSettings { managerConnCount = 50 }
   conn <- mkMinioConn (setRegion s3region . setCreds s3creds $ s3conn) mgr
   pure $ MinioHandler \f -> do
     try (runMinioWith conn (f conn)) <&> \case
