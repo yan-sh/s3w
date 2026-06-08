@@ -10,6 +10,8 @@ import qualified System.Environment as Env
 import Control.Exception
 import Control.Monad
 import Control.Concurrent
+import System.Timeout
+import qualified UnliftIO.Timeout as U
 import GHC.Exception
 import Network.Wai.Handler.Warp
 import Network.Wai
@@ -153,18 +155,22 @@ withQueueOperationsTBQueue
   -> IO b
 withQueueOperationsTBQueue log_ f1 f2 = do
   f1 $ f2 do
-    q <- newTBQueueIO 64
+    q <- newTBQueueIO 256
     active <- newTVarIO True
     pure $ QueueHandler
       { onTakingQ = \onClose onTake -> do
-          mchunk <- atomically $ readTBQueue q
-          case mchunk of
+          result <- timeout 30_000_000 (atomically $ readTBQueue q)
+          case result of
             Nothing -> do
               r <- onClose
-              r <$ log_ "on close"
-            Just x -> do
-              r <- onTake x
-              r <$ log_ "on take"
+              r <$ log_ "on timeout"
+            Just mchunk -> case mchunk of
+              Nothing -> do
+                r <- onClose
+                r <$ log_ "on close"
+              Just x -> do
+                r <- onTake x
+                r <$ log_ "on take"
       , putQ = \x -> atomically $ do
           a <- readTVar active
           when a $ writeTBQueue q (Just x)
@@ -233,17 +239,18 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
 
     log_ Info "client" [] "got request"
     
-    let chunkStreamer sendChunk flush = 
-          fix \f -> onTakingQ flush \chunk -> sendChunk (fromByteString chunk) >> f
-
-        minioGet = do
+    let minioGet = do
 
           gor <- do
-            U.try (getObject bucket key defaultGetObjectOptions) >>= \case
+            U.try (U.timeout 30_000_000 $ getObject bucket key defaultGetObjectOptions) >>= \case
               Left (e :: SomeException) -> do
                 U.putMVar gorObjectInfoMVar $ Left e
                 U.throwIO e
-              Right gor -> do
+              Right Nothing -> do
+                let e :: SomeException = toException $ userError "getObject timeout"
+                U.putMVar gorObjectInfoMVar $ Left e
+                U.throwIO e
+              Right (Just gor) -> do
                 U.putMVar gorObjectInfoMVar $ Right $ gorObjectInfo gor
                 pure gor 
 
@@ -261,11 +268,14 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
 
     takeMVar gorObjectInfoMVar >>= \case
       Left _e -> do
-        stopQ
+        closeQ
         cancel asyncGet
         rr $ responseLBS internalServerError500 [] ""
       Right gorObjectInfo_
         | size_ <- T.pack $ show $ oiSize gorObjectInfo_ -> do
+        let chunkStreamer sendChunk flush = do
+              _ <- fix \f -> onTakingQ flush \chunk -> sendChunk (fromByteString chunk) >> f
+              cancel asyncGet
         rr $ responseStream ok200
             [ ( hContentType, "application/octet-stream")
             , ( hContentLength, encodeUtf8 size_)
