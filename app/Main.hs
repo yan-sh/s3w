@@ -119,16 +119,18 @@ main = do
   Env.getArgs >>= \case
     ["--version"] -> putStrLn (showVersion version)
     _ -> do
+      getObjectTimeout <- maybe 30_000_000 ((* 1_000_000) . read) <$> Env.lookupEnv "S3W_GET_TIMEOUT_SEC"
+      queueTimeout <- maybe 30_000_000 ((* 1_000_000) . read) <$> Env.lookupEnv "S3W_QUEUE_TIMEOUT_SEC"
       minioRunner <- mkMinioAppRunner 
       port <- read <$> obtainEnv "S3W_PORT"
       
       (Env.lookupEnv "S3W_MIN_LOG" <&> join . fmap readMaybe)
         >>= maybe pass (atomically . writeTVar minimalLogSeverity)
 
-      withQueueOperationsTBQueue
+      withQueueOperationsTBQueue queueTimeout
         ((mkLogCurrentTime $ log) Debug "queue" [])
         (run port)
-        (app minioRunner)
+        (app getObjectTimeout minioRunner)
 
 obtainS3Creds :: IO CredentialValue
 obtainS3Creds = findFirst [fromAWSEnv] >>= \case
@@ -150,17 +152,18 @@ obtainEnv env = do
 -- type CloseQ q = q -> IO ()
 
 withQueueOperationsTBQueue
-  :: (String -> IO ())
+  :: Int
+  -> (String -> IO ())
   -> (a -> IO b)
   -> (IO QueueHandler -> a)
   -> IO b
-withQueueOperationsTBQueue log_ f1 f2 = do
+withQueueOperationsTBQueue queueTimeout log_ f1 f2 = do
   f1 $ f2 do
     q <- newTBQueueIO 256
     active <- newTVarIO True
     pure $ QueueHandler
       { onTakingQ = \onClose onTake -> do
-          result <- timeout 30_000_000 (atomically $ readTBQueue q)
+          result <- timeout queueTimeout (atomically $ readTBQueue q)
           case result of
             Nothing -> do
               r <- onClose
@@ -233,8 +236,8 @@ mkPutObjectOptions = L.foldr f defaultPutObjectOptions
       | h == "content-disposition" = acc { pooContentDisposition = Just $ TE.decodeUtf8 v}
       | otherwise = acc
 
-app :: MinioHandler -> IO QueueHandler -> Application
-app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "GET" <- requestMethod req= do
+app :: Int -> MinioHandler -> IO QueueHandler -> Application
+app getObjectTimeout (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "GET" <- requestMethod req= do
     let log_ = mkLogBucketKey bucket key $ mkLogMethod "get" $ mkLogCurrentTime log
     QueueHandler{..} <- mkQ
     gorObjectInfoMVar <- newEmptyMVar
@@ -244,7 +247,7 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
     let minioGet = do
 
           gor <- do
-            U.try (U.timeout 30_000_000 $ getObject bucket key defaultGetObjectOptions) >>= \case
+            U.try (U.timeout getObjectTimeout $ getObject bucket key defaultGetObjectOptions) >>= \case
               Left (e :: SomeException) -> do
                 U.putMVar gorObjectInfoMVar $ Left e
                 U.throwIO e
@@ -287,7 +290,7 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
 
 
    
-app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "PUT" <- requestMethod req = do
+app _ (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "PUT" <- requestMethod req = do
   let log_ = mkLogBucketKey bucket key $ mkLogMethod "put" $ mkLogCurrentTime log
   QueueHandler{..} <- mkQ
 
@@ -327,4 +330,4 @@ app (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket key bucket) rr | "
       
 
     
-app _ _ _ rr = rr $ responseLBS badRequest400 [] "API is not supported yet"
+app _ _ _ _ rr = rr $ responseLBS badRequest400 [] "API is not supported yet"
