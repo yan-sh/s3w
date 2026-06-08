@@ -18,6 +18,7 @@ import Network.Wai
 import Network.Minio
 import Network.HTTP.Types
 import Network.HTTP.Client.TLS
+import Network.HTTP.Client (newManager, managerConnCount)
 import Data.Text as T
 import Data.Text.Encoding as TE
 import Data.String
@@ -216,7 +217,8 @@ mkMinioAppRunner = do
   s3region <- T.pack <$> obtainEnv "S3_REGION"
   s3conn <- fromString <$> obtainEnv "S3_CONN_STR"
   s3creds <- obtainS3Creds 
-  conn <- join $ mkMinioConn (setRegion s3region . setCreds s3creds $ s3conn ) <$> newTlsManager
+  mgr <- newManager tlsManagerSettings { managerConnCount = 20 }
+  conn <- mkMinioConn (setRegion s3region . setCreds s3creds $ s3conn) mgr
   pure $ MinioHandler \f -> do
     try (runMinioWith conn (f conn)) <&> \case
       Left e          -> MinioException e

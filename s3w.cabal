@@ -37,6 +37,7 @@ executable s3w
       , conduit
       , http-conduit
       , text
+      , http-client
       , http-client-tls
       , bytestring
       , binary
