@@ -274,15 +274,20 @@ app getObjectTimeout (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket k
           liftIO $ log_ Debug "client.minioGet" [] "start getting getObjectResult"
 
           gor <- do
-            U.try (U.timeout getObjectTimeout $ getObject bucket key defaultGetObjectOptions) >>= \case
+            gorRes <- U.try (U.timeout getObjectTimeout $ getObject bucket key defaultGetObjectOptions)
+            liftIO $ log_ Debug "client.minioGet" [] "getting getObjectResult done"
+            case gorRes of
               Left (e :: SomeException) -> do
+                liftIO $ log_ Debug "client.minioGet" [] "got some exception"
                 U.putMVar gorObjectInfoMVar $ Left e
                 U.throwIO e
               Right Nothing -> do
+                liftIO $ log_ Debug "client.minioGet" [] "got timeout"
                 let e :: SomeException = toException $ userError "getObject timeout"
                 U.putMVar gorObjectInfoMVar $ Left e
                 U.throwIO e
               Right (Just gor) -> do
+                liftIO $ log_ Debug "client.minioGet" [] "got right getObjectResult"
                 U.putMVar gorObjectInfoMVar $ Right $ gorObjectInfo gor
                 pure gor 
           
