@@ -121,11 +121,14 @@ main = do
     _ -> do
       getObjectTimeout <- maybe 30_000_000 ((* 1_000_000) . read) <$> Env.lookupEnv "S3W_GET_TIMEOUT_SEC"
       queueTimeout <- maybe 30_000_000 ((* 1_000_000) . read) <$> Env.lookupEnv "S3W_QUEUE_TIMEOUT_SEC"
-      minioRunner <- mkMinioAppRunner 
+      tracker <- mkConnTracker
+      minioRunner <- mkMinioAppRunner tracker
       port <- read <$> obtainEnv "S3W_PORT"
       
       (Env.lookupEnv "S3W_MIN_LOG" <&> join . fmap readMaybe)
         >>= maybe pass (atomically . writeTVar minimalLogSeverity)
+
+      void $ forkIO $ backgroundConnLogger tracker (mkLogCurrentTime log)
 
       withQueueOperationsTBQueue queueTimeout
         ((mkLogCurrentTime $ log) Debug "queue" [])
@@ -213,16 +216,38 @@ mkLogMethod m logger ls_ ns ctxs msg = logger ls_ ns ctxs_ msg
           ]
 
 
+data ConnTracker = ConnTracker
+  { ctActive :: TVar Int
+  , ctMax    :: Int
+  }
+
+mkConnTracker :: IO ConnTracker
+mkConnTracker = ConnTracker <$> newTVarIO 0 <*> pure 50
+
+trackConnection :: ConnTracker -> IO a -> IO a
+trackConnection tracker action = do
+  atomically $ modifyTVar' (ctActive tracker) (+1)
+  action `finally` atomically (modifyTVar' (ctActive tracker) (subtract 1))
+
+getActiveConns :: ConnTracker -> IO Int
+getActiveConns = readTVarIO . ctActive
+
+backgroundConnLogger :: ConnTracker -> Logger -> IO ()
+backgroundConnLogger tracker logger = forever $ do
+  threadDelay 5_000_000
+  active <- getActiveConns tracker
+  logger Debug "pool" [("active", asCtx active), ("max", asCtx $ ctMax tracker)] "connection pool stats"
+
 data MinioHandler = MinioHandler (forall a . (MinioConn -> Minio a) -> IO (MinioResult a)) 
 
-mkMinioAppRunner :: IO MinioHandler
-mkMinioAppRunner = do
+mkMinioAppRunner :: ConnTracker -> IO MinioHandler
+mkMinioAppRunner tracker = do
   s3region <- T.pack <$> obtainEnv "S3_REGION"
   s3conn <- fromString <$> obtainEnv "S3_CONN_STR"
   s3creds <- obtainS3Creds 
-  mgr <- newManager tlsManagerSettings { managerConnCount = 50 }
+  mgr <- newManager tlsManagerSettings { managerConnCount = ctMax tracker }
   conn <- mkMinioConn (setRegion s3region . setCreds s3creds $ s3conn) mgr
-  pure $ MinioHandler \f -> do
+  pure $ MinioHandler \f -> trackConnection tracker do
     try (runMinioWith conn (f conn)) <&> \case
       Left e          -> MinioException e
       Right (Left me) -> MinioError me
