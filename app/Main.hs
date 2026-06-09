@@ -270,6 +270,8 @@ app getObjectTimeout (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket k
     log_ Info "client" [] "got request"
     
     let minioGet = do
+      
+          liftIO $ log_ Debug "client.minioGet" [] "start getting getObjectResult"
 
           gor <- do
             U.try (U.timeout getObjectTimeout $ getObject bucket key defaultGetObjectOptions) >>= \case
@@ -283,6 +285,8 @@ app getObjectTimeout (MinioHandler runMinioApp) mkQ req@(pathInfo -> KeyBucket k
               Right (Just gor) -> do
                 U.putMVar gorObjectInfoMVar $ Right $ gorObjectInfo gor
                 pure gor 
+          
+          liftIO $ log_ Debug "client.minioGet" [] "getting getObjectResult done"
 
           runConduit $ gorObjectStream gor .| CC.mapM_ (liftIO . putQ)
  
